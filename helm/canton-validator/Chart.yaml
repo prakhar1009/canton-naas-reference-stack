@@ -1,0 +1,44 @@
+apiVersion: v2
+name: canton-validator
+description: A Helm chart for deploying a Canton Validator node for a Canton Network as a Service (NaaS) provider.
+type: application
+
+# This is the chart version. This should be incremented each time you make changes
+# to the chart and its templates.
+# Versions should be semantic versions (https://semver.org).
+version: 0.1.0
+
+# This is the version number of the application being deployed. This version number should be
+# incremented each time you make changes to the application.
+appVersion: "3.1.0"
+
+keywords:
+  - canton
+  - daml
+  - validator
+  - dlt
+  - blockchain
+  - naas
+
+home: https://github.com/canton-naas-reference-stack
+sources:
+  - https://github.com/canton-naas-reference-stack/tree/main/helm/canton-validator
+
+maintainers:
+  - name: NaaS Reference Stack Maintainers
+    email: maintainers@example-naas.com
+    url: https://github.com/canton-naas-reference-stack
+
+icon: https://www.canton.network/wp-content/uploads/2023/12/Canton-Logo-Full-Dark.svg
+
+# A list of the chart's dependencies. A Canton validator requires a database.
+# This chart includes the Bitnami PostgreSQL chart as a dependency.
+dependencies:
+  - name: postgresql
+    version: "14.2.3"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+    alias: database
+    # Import values from the subchart's values.yaml to the parent's values.yaml
+    tags:
+      - canton-database
