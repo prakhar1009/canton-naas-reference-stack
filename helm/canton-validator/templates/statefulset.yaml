@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "canton-validator.fullname" . }}
+  labels:
+    {{- include "canton-validator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "canton-validator.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "canton-validator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "canton-validator.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "canton-validator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "canton"
+          args:
+            - "daemon"
+            - "--config"
+            - "/etc/canton/canton.conf"
+            {{- if .Values.bootstrapScript }}
+            - "--bootstrap"
+            - "/etc/canton/bootstrap.canton"
+            {{- end }}
+          ports:
+            - name: admin-api
+              containerPort: {{ .Values.service.admin.port }}
+              protocol: TCP
+            - name: public-api
+              containerPort: {{ .Values.service.public.port }}
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: admin-api
+            initialDelaySeconds: 45
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: admin-api
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/canton/canton.conf
+              subPath: canton.conf
+            {{- if .Values.bootstrapScript }}
+            - name: bootstrap
+              mountPath: /etc/canton/bootstrap.canton
+              subPath: bootstrap.canton
+            {{- end }}
+            - name: data
+              mountPath: /var/lib/canton
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "canton-validator.fullname" . }}-config
+        {{- if .Values.bootstrapScript }}
+        - name: bootstrap
+          configMap:
+            name: {{ include "canton-validator.fullname" . }}-bootstrap
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "canton-validator.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- else }}
+  # If persistence is disabled, we add an emptyDir volume for the data
+  # This is not recommended for production but useful for testing.
+  template:
+    spec:
+      volumes:
+        - name: data
+          emptyDir: {}
+  {{- end }}
