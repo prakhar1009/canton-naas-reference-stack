@@ -1,0 +1,186 @@
+# Default values for canton-validator chart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: digitalasset/canton
+  pullPolicy: IfNotPresent
+  # Overridden by AppVersion in Chart.yaml. Example: 3.1.0
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+# Service configuration for the validator node
+service:
+  # The public Ledger API service for participants to connect
+  publicApi:
+    type: ClusterIP
+    port: 5012
+  # The admin API service for node administration
+  adminApi:
+    type: ClusterIP
+    port: 5011
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: "nginx"
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: validator.your-domain.com
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: validator-tls
+  #    hosts:
+  #      - validator.your-domain.com
+
+resources:
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Canton specific configuration
+# This will be used to generate the validator.conf file
+canton:
+  # The name of the validator node within the Canton configuration
+  nodeName: "my-validator"
+
+  # Domain manager connection details
+  domainManager:
+    host: "domain-manager.default.svc.cluster.local"
+    port: 5021
+
+  # Storage configuration for the validator's state
+  storage:
+    type: "postgresql"
+    config:
+      host: "postgresql.database.svc.cluster.local"
+      port: 5432
+      databaseName: "validator_db"
+      user: "validator_user"
+      # Kubernetes secret containing the database password
+      passwordSecret:
+        name: "validator-db-password"
+        key: "password"
+        # Environment variable name inside the container
+        # This MUST match the variable name in the raw config below (e.g., ${C_DB_PASSWORD})
+        envVarName: C_DB_PASSWORD
+
+  # Set to true to initialize the database schema and validator node on first start
+  bootstrap:
+    enabled: true
+
+# Raw Canton configuration content. This allows for advanced customization.
+# The `config` block will be templated with values from this `values.yaml` file.
+# It is mounted as a configmap and used by the Canton process.
+config: |
+  canton {
+    monitoring {
+      health.port = 8080
+      metrics.reporters = [
+        {
+          type = prometheus
+          port = 9185
+          address = "0.0.0.0"
+        }
+      ]
+    }
+
+    validators {
+      {{ .Values.canton.nodeName }} {
+        domain-manager-connection {
+          host = {{ .Values.canton.domainManager.host | quote }}
+          port = {{ .Values.canton.domainManager.port }}
+          # Use tls-client-auth = require for production with mTLS
+          tls.client-auth = "none"
+        }
+
+        storage = {
+          type = {{ .Values.canton.storage.type | quote }}
+          config {
+            driver = "org.postgresql.Driver"
+            url = "jdbc:postgresql://{{ .Values.canton.storage.config.host }}:{{ .Values.canton.storage.config.port }}/{{ .Values.canton.storage.config.databaseName }}"
+            user = {{ .Values.canton.storage.config.user | quote }}
+            # The password will be injected as an environment variable from the secret
+            password = ${C_DB_PASSWORD}
+            pool {
+              # Recommended pool size for production workloads
+              connection-pool-size = 20
+            }
+          }
+        }
+
+        crypto {
+          provider = jce
+          # For production, consider using a KMS-based crypto provider
+          # provider = aws-kms
+          # provider = gcp-kms
+        }
+
+        public-api {
+          port = {{ .Values.service.publicApi.port }}
+          address = "0.0.0.0"
+        }
+
+        admin-api {
+          port = {{ .Values.service.adminApi.port }}
+          address = "0.0.0.0"
+        }
+
+        # Enable auto-initialization on first start if configured
+        {{- if .Values.canton.bootstrap.enabled }}
+        init.auto-init = true
+        {{- end }}
+      }
+    }
+  }
