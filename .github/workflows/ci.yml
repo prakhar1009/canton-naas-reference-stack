@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# Ensures that only one workflow run is triggered for a given PR,
+# cancelling any previously running workflows for the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # Allow checkout action to read the repository content
+
+jobs:
+  validate-terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Use a recent, stable version of Terraform
+          terraform_version: 1.8.0
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ./terraform
+
+      # For a comprehensive CI, you would have separate steps to `init`, `validate`, and `plan`
+      # for each of your root Terraform configurations (e.g., for AWS, GCP, Azure).
+      # Since the provided structure only contains a module, we validate the module itself.
+      - name: Terraform Init Module
+        id: init
+        run: terraform init -backend=false
+        working-directory: ./terraform/modules/kms
+
+      - name: Terraform Validate Module
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ./terraform/modules/kms
+
+  lint-helm:
+    name: Lint Helm Charts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          # Use a recent, stable version of Helm
+          version: v3.15.2
+
+      - name: Build Helm Chart Dependencies
+        # This step is crucial if your chart has external dependencies listed in Chart.yaml
+        run: helm dependency build ./helm/canton-validator
+
+      - name: Lint Helm Chart
+        # The lint command checks the chart for potential issues and best practices
+        run: helm lint ./helm/canton-validator
