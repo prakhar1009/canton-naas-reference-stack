@@ -1,0 +1,77 @@
+{{- if .Values.upgradeJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "canton-validator.fullname" . }}-upgrade
+  labels:
+    {{- include "canton-validator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.upgradeJob.backoffLimit | default 3 }}
+  template:
+    metadata:
+      name: {{ include "canton-validator.fullname" . }}-upgrade-pod
+      labels:
+        {{- include "canton-validator.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: upgrade-job
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "canton-validator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}-upgrade-job
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/opt/canton/bin/canton"
+          args:
+            - "storage"
+            - "migrate"
+            - "--config=/etc/canton/validator.conf"
+          env:
+            # Assumes the canton config file uses environment variable substitution for the DB password
+            # e.g., password = ${CantonDbPassword}
+            - name: CantonDbPassword
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.storage.secretName | default (include "canton-validator.fullname" .) }}
+                  key: {{ .Values.config.storage.secretKey | default "db-password" }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/canton
+              readOnly: true
+          resources:
+            {{- toYaml .Values.upgradeJob.resources | nindent 12 }}
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ include "canton-validator.fullname" . }}
+            items:
+              - key: validator.conf
+                path: validator.conf
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
