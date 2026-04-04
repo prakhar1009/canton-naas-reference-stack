@@ -1,227 +1,357 @@
-# terraform/modules/aws/main.tf
+# Terraform module to deploy a Canton node (Participant or Validator) within an Auto Scaling Group on AWS.
+# This module sets up networking, IAM roles, a launch template with Canton installation,
+# and an Auto Scaling Group with an ELB health check targeting the Canton admin API.
 
-# ------------------------------------------------------------------------------
-# Variables
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------
+# Module Input Variables
+# ---------------------------------------------------------------------------------------------------------------------
 
-variable "aws_region" {
-  description = "The AWS region to deploy resources in."
+variable "name_prefix" {
+  description = "A prefix used for naming all created resources."
   type        = string
-  default     = "us-east-1"
 }
 
-variable "cluster_name" {
-  description = "The name of the EKS cluster."
+variable "vpc_id" {
+  description = "The ID of the VPC where resources will be created."
   type        = string
-  default     = "canton-naas-cluster"
 }
 
-variable "cluster_version" {
-  description = "The Kubernetes version for the EKS cluster."
-  type        = string
-  default     = "1.29"
-}
-
-variable "vpc_cidr" {
-  description = "The CIDR block for the VPC."
-  type        = string
-  default     = "10.0.0.0/16"
-}
-
-variable "azs" {
-  description = "A list of Availability Zones to deploy into."
+variable "subnet_ids" {
+  description = "A list of subnet IDs where the Canton nodes will be deployed."
   type        = list(string)
-  default     = []
 }
 
-variable "private_subnets" {
-  description = "A list of CIDR blocks for private subnets."
-  type        = list(string)
-  default     = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+variable "instance_type" {
+  description = "The EC2 instance type for the Canton nodes."
+  type        = string
+  default     = "t3.large"
 }
 
-variable "public_subnets" {
-  description = "A list of CIDR blocks for public subnets."
+variable "ami_id" {
+  description = "The AMI ID to use for the EC2 instances. Should be an Amazon Linux 2 or similar."
+  type        = string
+}
+
+variable "key_name" {
+  description = "The name of the EC2 key pair to allow SSH access to the instances."
+  type        = string
+}
+
+variable "kms_key_arn" {
+  description = "The ARN of the AWS KMS key used for signing transactions."
+  type        = string
+}
+
+variable "ssh_access_cidr" {
+  description = "CIDR block to allow SSH access from."
   type        = list(string)
-  default     = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  default     = ["0.0.0.0/0"]
+}
+
+variable "canton_version" {
+  description = "The version of Canton Enterprise to deploy."
+  type        = string
+  default     = "3.1.0"
+}
+
+variable "canton_node_type" {
+  description = "The type of Canton node to configure. Either 'participant' or 'validator'."
+  type        = string
+  default     = "participant"
+  validation {
+    condition     = contains(["participant", "validator"], var.canton_node_type)
+    error_message = "The node type must be either 'participant' or 'validator'."
+  }
+}
+
+variable "canton_node_name" {
+  description = "The alias for the Canton node inside the configuration."
+  type        = string
+  default     = "participant1"
+}
+
+variable "canton_admin_port" {
+  description = "The port for the Canton admin API."
+  type        = number
+  default     = 5012
+}
+
+variable "canton_public_port" {
+  description = "The port for the Canton public/ledger API."
+  type        = number
+  default     = 5011
+}
+
+variable "asg_min_size" {
+  description = "The minimum number of instances in the Auto Scaling Group."
+  type        = number
+  default     = 1
+}
+
+variable "asg_max_size" {
+  description = "The maximum number of instances in the Auto Scaling Group."
+  type        = number
+  default     = 2
+}
+
+variable "asg_desired_capacity" {
+  description = "The desired number of instances in the Auto Scaling Group."
+  type        = number
+  default     = 1
 }
 
 variable "tags" {
   description = "A map of tags to assign to all resources."
   type        = map(string)
-  default = {
-    Project     = "canton-naas-reference-stack"
-    ManagedBy   = "Terraform"
-    Environment = "production"
-  }
+  default     = {}
 }
 
-# ------------------------------------------------------------------------------
-# Locals and Data Sources
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------
+# Local Variables
+# ---------------------------------------------------------------------------------------------------------------------
 
 locals {
-  cluster_name = var.cluster_name
-  tags         = var.tags
+  canton_node_config_plural = var.canton_node_type == "participant" ? "participants" : "validators"
+  common_tags = merge(var.tags, {
+    Project = "canton-naas-reference-stack"
+    Tier    = "CantonNode"
+  })
 }
 
-data "aws_availability_zones" "available" {
-  state = "available"
-}
+# ---------------------------------------------------------------------------------------------------------------------
+# IAM Role and Instance Profile for Canton EC2 Nodes
+# ---------------------------------------------------------------------------------------------------------------------
 
-# Use specified AZs or default to the first 3 available ones
-locals {
-  azs = length(var.azs) > 0 ? var.azs : slice(data.aws_availability_zones.available.names, 0, 3)
-}
+resource "aws_iam_role" "canton_node" {
+  name = "${var.name_prefix}-canton-node-role"
+  tags = local.common_tags
 
-# ------------------------------------------------------------------------------
-# Networking (VPC, Subnets, etc.)
-# ------------------------------------------------------------------------------
-
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.5.3"
-
-  name = "${local.cluster_name}-vpc"
-  cidr = var.vpc_cidr
-
-  azs             = local.azs
-  private_subnets = var.private_subnets
-  public_subnets  = var.public_subnets
-
-  enable_nat_gateway   = true
-  single_nat_gateway   = false # Use one NAT gateway per AZ for HA
-  enable_dns_hostnames = true
-
-  public_subnet_tags = {
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
-    "kubernetes.io/role/elb"                      = "1"
-  }
-
-  private_subnet_tags = {
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
-    "kubernetes.io/role/internal-elb"             = "1"
-  }
-
-  tags = local.tags
-}
-
-# ------------------------------------------------------------------------------
-# EKS Cluster
-# ------------------------------------------------------------------------------
-
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "20.8.4"
-
-  cluster_name    = local.cluster_name
-  cluster_version = var.cluster_version
-
-  cluster_endpoint_public_access = true
-
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
-
-  # KMS Key for encrypting Kubernetes secrets in etcd
-  cluster_encryption_config = [{
-    provider_key_arn = module.kms.key_arn
-    resources        = ["secrets"]
-  }]
-
-  # EKS Managed Node Groups
-  eks_managed_node_groups = {
-    # Core on-demand nodes for critical Canton components (sequencer, mediator)
-    core_services = {
-      name           = "core-services-ondemand"
-      instance_types = ["m5.large", "m5a.large", "m6i.large"]
-      min_size       = 2
-      max_size       = 5
-      desired_size   = 2
-      subnet_ids     = module.vpc.private_subnets
-      block_device_mappings = {
-        xvda = {
-          device_name = "/dev/xvda"
-          ebs = {
-            volume_size           = 50
-            volume_type           = "gp3"
-            delete_on_termination = true
-          }
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [
+      {
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
         }
-      }
-    }
+      },
+    ]
+  })
+}
 
-    # Scalable spot nodes for tenant validator nodes (cost-effective)
-    tenant_validators = {
-      name           = "tenant-validators-spot"
-      capacity_type  = "SPOT"
-      instance_types = ["t3.large", "t3a.large", "m5.large"]
-      min_size       = 1
-      max_size       = 20
-      desired_size   = 2
-      subnet_ids     = module.vpc.private_subnets
-      labels = {
-        "node.canton-naas.io/pool" = "tenant-validators"
-      }
-      taints = [{
-        key    = "canton-naas.io/tenant-node"
-        value  = "true"
-        effect = "NO_SCHEDULE"
-      }]
+resource "aws_iam_role_policy" "canton_kms_access" {
+  name = "${var.name_prefix}-canton-kms-access-policy"
+  role = aws_iam_role.canton_node.id
+
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "kms:Sign",
+          "kms:GetPublicKey"
+        ]
+        Effect   = "Allow"
+        Resource = var.kms_key_arn
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.canton_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "canton_node" {
+  name = "${var.name_prefix}-canton-node-profile"
+  role = aws_iam_role.canton_node.name
+  tags = local.common_tags
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Security Group for Canton Nodes
+# ---------------------------------------------------------------------------------------------------------------------
+
+resource "aws_security_group" "canton_node" {
+  name        = "${var.name_prefix}-canton-node-sg"
+  description = "Security group for Canton nodes"
+  vpc_id      = var.vpc_id
+  tags        = local.common_tags
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = var.ssh_access_cidr
+    description = "Allow SSH access"
+  }
+
+  ingress {
+    from_port   = var.canton_public_port
+    to_port     = var.canton_public_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow Canton Public/Ledger API access"
+  }
+
+  ingress {
+    from_port   = var.canton_admin_port
+    to_port     = var.canton_admin_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # For ELB health checks
+    description = "Allow Canton Admin API access"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Application Load Balancer and Target Group for Health Checks
+# ---------------------------------------------------------------------------------------------------------------------
+
+resource "aws_lb" "canton" {
+  name               = "${var.name_prefix}-canton-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.canton_node.id]
+  subnets            = var.subnet_ids
+  tags               = local.common_tags
+}
+
+resource "aws_lb_target_group" "canton_health_check" {
+  name        = "${var.name_prefix}-canton-tg"
+  port        = var.canton_admin_port
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+  tags        = local.common_tags
+
+  health_check {
+    enabled             = true
+    path                = "/v1/health"
+    protocol            = "HTTP"
+    port                = "traffic-port"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
+resource "aws_lb_listener" "canton_public" {
+  load_balancer_arn = aws_lb.canton.arn
+  port              = var.canton_public_port
+  protocol          = "TCP" # Use TCP for gRPC traffic to the Ledger API
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.canton_health_check.arn
+  }
+}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# EC2 Launch Template with User Data
+# ---------------------------------------------------------------------------------------------------------------------
+
+resource "aws_launch_template" "canton_node" {
+  name_prefix   = "${var.name_prefix}-canton-"
+  image_id      = var.ami_id
+  instance_type = var.instance_type
+  key_name      = var.key_name
+  tags          = local.common_tags
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.canton_node.arn
+  }
+
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.canton_node.id]
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = local.common_tags
+  }
+
+  user_data = base64encode(templatefile("${path.module}/user-data.sh.tpl", {
+    CANTON_VERSION            = var.canton_version
+    CANTON_NODE_TYPE_PLURAL   = local.canton_node_config_plural
+    CANTON_NODE_NAME          = var.canton_node_name
+    KMS_KEY_ARN               = var.kms_key_arn
+    AWS_REGION                = data.aws_region.current.name
+    ADMIN_PORT                = var.canton_admin_port
+    PUBLIC_PORT               = var.canton_public_port
+  }))
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+data "aws_region" "current" {}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Auto Scaling Group for Canton Nodes
+# ---------------------------------------------------------------------------------------------------------------------
+
+resource "aws_autoscaling_group" "canton" {
+  name                      = "${var.name_prefix}-canton-asg"
+  min_size                  = var.asg_min_size
+  max_size                  = var.asg_max_size
+  desired_capacity          = var.asg_desired_capacity
+  vpc_zone_identifier       = var.subnet_ids
+  health_check_type         = "ELB"
+  health_check_grace_period = 300 # Give Canton time to start and become healthy
+  target_group_arns         = [aws_lb_target_group.canton_health_check.arn]
+
+  launch_template {
+    id      = aws_launch_template.canton_node.id
+    version = "$Latest"
+  }
+
+  # Ensure instances are replaced if the launch template changes
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
     }
   }
 
-  tags = local.tags
+  dynamic "tag" {
+    for_each = local.common_tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
 }
 
-# ------------------------------------------------------------------------------
-# KMS Key for EKS Secret Encryption
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------------------
+# Module Outputs
+# ---------------------------------------------------------------------------------------------------------------------
 
-module "kms" {
-  source  = "terraform-aws-modules/kms/aws"
-  version = "1.6.0"
-
-  alias               = "alias/eks/${local.cluster_name}"
-  description         = "KMS key for EKS cluster secrets encryption"
-  enable_key_rotation = true
-  tags                = local.tags
+output "autoscaling_group_name" {
+  description = "The name of the Canton Auto Scaling Group."
+  value       = aws_autoscaling_group.canton.name
 }
 
-# ------------------------------------------------------------------------------
-# Outputs
-# ------------------------------------------------------------------------------
-
-output "cluster_name" {
-  description = "The name of the EKS cluster."
-  value       = module.eks.cluster_name
+output "load_balancer_dns_name" {
+  description = "The DNS name of the Application Load Balancer."
+  value       = aws_lb.canton.dns_name
 }
 
-output "cluster_endpoint" {
-  description = "The endpoint for the EKS cluster's Kubernetes API."
-  value       = module.eks.cluster_endpoint
-}
-
-output "cluster_ca_certificate" {
-  description = "The base64 encoded certificate data required to communicate with the cluster."
-  value       = module.eks.cluster_certificate_authority_data
-}
-
-output "cluster_oidc_issuer_url" {
-  description = "The OIDC issuer URL for the EKS cluster."
-  value       = module.eks.cluster_oidc_issuer_url
-}
-
-output "vpc_id" {
-  description = "The ID of the VPC."
-  value       = module.vpc.vpc_id
-}
-
-output "private_subnets" {
-  description = "List of IDs of private subnets."
-  value       = module.vpc.private_subnets
-}
-
-output "public_subnets" {
-  description = "List of IDs of public subnets."
-  value       = module.vpc.public_subnets
+output "iam_role_arn" {
+  description = "The ARN of the IAM role created for the Canton nodes."
+  value       = aws_iam_role.canton_node.arn
 }
