@@ -1,0 +1,117 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "canton-validator.fullname" . }}
+  labels:
+    {{- include "canton-validator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "canton-validator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Rule 1: Allow intra-release communication on Canton ports.
+    # This allows other Canton nodes (e.g. other validators in a cluster, Canton Console)
+    # deployed within the same Helm release to communicate with this validator.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.public.port }}
+        - protocol: TCP
+          port: {{ .Values.service.admin.port }}
+        - protocol: TCP
+          port: {{ .Values.service.p2p.port }}
+
+    # Rule 2: Allow metrics scraping from Prometheus.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # This label is recommended by Kubernetes for identifying namespaces.
+              # Adjust if your monitoring namespace uses a different labeling scheme.
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace | default "monitoring" }}
+        - podSelector:
+            matchLabels:
+              {{ .Values.monitoring.prometheusLabel | default "app.kubernetes.io/name" }}: {{ .Values.monitoring.prometheusLabelValue | default "prometheus" }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.metrics.port }}
+
+    # Rule 3: Allow external access to API ports from specified CIDRs.
+    # Configure this to allow access for dApp backends, operational dashboards, etc.
+    {{- if .Values.networkPolicy.ingressApiCidrs }}
+    - from:
+        {{- range .Values.networkPolicy.ingressApiCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.public.port }}
+        - protocol: TCP
+          port: {{ .Values.service.admin.port }}
+    {{- end }}
+
+  egress:
+    # Rule 1: Allow DNS resolution. Essential for all outbound communication.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Rule 2: Allow connections to other pods in this release.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+
+    # Rule 3: Allow connections to remote Canton domains (sequencers, mediators).
+    # This rule is broad (allows all ports to the CIDR). For tighter security,
+    # consider creating more specific rules if the remote ports are known and fixed.
+    {{- if .Values.networkPolicy.egressRemoteDomainCidrs }}
+    - to:
+        {{- range .Values.networkPolicy.egressRemoteDomainCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+    {{- end }}
+
+    # Rule 4: Allow connections to the Scribe/PQS database if enabled.
+    {{- if and .Values.scribe.enabled .Values.networkPolicy.egressScribeDbCidr }}
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.egressScribeDbCidr }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.scribe.database.port | default 5432 }}
+    {{- end }}
+
+    # Rule 5: Allow connections to cloud provider APIs (KMS, etc.) over HTTPS.
+    # This is a broad rule necessary for KMS integration. For higher security, replace
+    # with specific IP ranges for your cloud provider's services.
+    {{- if .Values.networkPolicy.allowEgressHttpsAnywhere }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # RFC1918 private address spaces.
+              # Prevents this broad rule from allowing access to internal networks.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end -}}
