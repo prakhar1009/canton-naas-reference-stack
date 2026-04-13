@@ -1,0 +1,275 @@
+# =========================================================================
+# Loki Values for Canton NaaS Reference Stack
+#
+# This file configures a production-ready, scalable Loki deployment for
+# centralized log aggregation. It is designed to be deployed alongside
+# Canton validators in a Kubernetes environment.
+#
+# Key features of this configuration:
+# - Microservices architecture (`SimpleScalable` mode) for scalability.
+# - Cloud-native object storage backend (S3, GCS, Azure).
+# - Promtail DaemonSet to automatically collect logs from all Canton nodes.
+# - Pre-configured pipeline to parse structured Canton logs.
+# - Sensible resource defaults for a small-to-medium NaaS deployment.
+# =========================================================================
+
+#
+# Loki Core Configuration
+#
+loki:
+  # `SimpleScalable` deploys a set of stateful ingesters and stateless components.
+  # This is the recommended starting point for a production NaaS.
+  deploymentMode: SimpleScalable
+
+  # Auth is disabled within the cluster. Access control should be managed via
+  # Kubernetes network policies and RBAC, or a frontend like Grafana.
+  auth_enabled: false
+
+  # Common configuration for all Loki components.
+  commonConfig:
+    replication_factor: 1
+
+  #
+  # STORAGE CONFIGURATION
+  #
+  # This is the most critical section to customize for your cloud provider.
+  # Choose ONE backend (s3, gcs, azure), uncomment it, and fill in your details.
+  # The bucket/container must be created manually before deploying Loki.
+  #
+  storage:
+    type: 's3' # Supported types: s3, gcs, azure, filesystem
+
+    # --- AWS S3 Configuration ---
+    s3:
+      # NOTE: These buckets must exist before deploying.
+      bucketNames:
+        chunks: "canton-naas-loki-chunks"
+        ruler: "canton-naas-loki-ruler"
+        admin: "canton-naas-loki-admin"
+      # Endpoint is region-specific, e.g., s3.us-east-1.amazonaws.com.
+      # Leave empty if using IRSA (IAM Roles for Service Accounts) or instance profiles.
+      endpoint: ""
+      region: ""
+      # Store credentials in a Kubernetes secret named `loki-s3-secret`.
+      # Secret keys should be `access_key_id` and `secret_access_key`.
+      # If using IRSA, these can be left commented out.
+      # secretAccessKey:
+      #   name: loki-s3-secret
+      #   key: secret_access_key
+      # accessKeyId:
+      #   name: loki-s3-secret
+      #   key: access_key_id
+      insecure: false
+      s3ForcePathStyle: false
+
+    # --- Google Cloud Storage (GCS) Configuration ---
+    # gcs:
+    #   bucketName: "your-gcs-bucket-for-loki"
+    #   # Create a service account with "Storage Object Admin" role for the bucket,
+    #   # create a key, and store it in a secret named `loki-gcs-secret` with key `gcs-credentials.json`.
+    #   serviceAccount:
+    #     name: loki-gcs-secret
+    #     key: gcs-credentials.json
+
+    # --- Azure Blob Storage Configuration ---
+    # azure:
+    #   containerName: "your-azure-container-for-loki"
+    #   # Store credentials in a secret `loki-azure-secret` with keys `account_name` and `account_key`.
+    #   accountName:
+    #     name: loki-azure-secret
+    #     key: account_name
+    #   accountKey:
+    #     name: loki-azure-secret
+    #     key: account_key
+
+  # Schema configuration for Loki's index and chunks.
+  schemaConfig:
+    configs:
+      - from: 2024-01-01
+        store: boltdb-shipper
+        object_store: s3 # IMPORTANT: Must match storage.type above (e.g., gcs, azure)
+        schema: v12
+        index:
+          prefix: loki_index_
+          period: 24h
+
+  # --- Component Resource Configurations ---
+  # Adjust these values based on your expected log volume and cluster size.
+
+  distributor:
+    replicas: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  ingester:
+    # StatefulSet for stable identity and storage.
+    replicas: 2
+    # Persistence for the WAL (Write Ahead Log).
+    # For production, use a fast managed storage class (e.g., gp3, premium-ssd).
+    persistence:
+      enabled: true
+      size: 20Gi
+      # storageClass: "gp3" # Example for AWS
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "1.5"
+        memory: 4Gi
+
+  querier:
+    replicas: 2
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1.5"
+        memory: 2Gi
+
+  queryFrontend:
+    replicas: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  compactor:
+    enabled: true
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  # Gateway (nginx) routes traffic to the correct Loki components.
+  gateway:
+    enabled: true
+    replicas: 2
+    service:
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+  # Disable components not strictly required for a basic logging setup.
+  ruler:
+    enabled: false
+
+#
+# Promtail Agent Configuration
+#
+# Promtail is the agent that collects logs and sends them to Loki.
+# It is deployed as a DaemonSet to run on every Kubernetes node.
+#
+promtail:
+  enabled: true
+  config:
+    clients:
+      - url: http://{{ .Release.Name }}-loki-distributor.{{ .Release.Namespace }}.svc.cluster.local:3100/loki/api/v1/push
+
+  # Scrape configurations to discover and tail log files from all pods.
+  scrape_configs: |
+    - job_name: kubernetes-pods
+      kubernetes_sd_configs:
+        - role: pod
+      pipeline_stages:
+        - docker: {}
+        - match:
+            selector: '{job="kubernetes-pods"}'
+            stages:
+            # Attempt to parse the log line as JSON. Canton validators can be configured
+            # to output structured JSON logs, which is highly recommended.
+            - json:
+                expressions:
+                  # Extract common structured log fields.
+                  level: level
+                  participant: 'participant'
+                  domain: 'domain'
+                  component: 'canton_component'
+            # Promote extracted fields to Loki labels for efficient querying.
+            - labels:
+                level:
+                participant:
+                domain:
+                component:
+      relabel_configs:
+        - source_labels:
+            - __meta_kubernetes_pod_node_name
+          target_label: __host__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - action: replace
+          replacement: $1
+          separator: /
+          source_labels:
+            - __meta_kubernetes_namespace
+            - __meta_kubernetes_pod_label_app_kubernetes_io_name
+          target_label: job
+        - action: replace
+          source_labels:
+            - __meta_kubernetes_namespace
+          target_label: namespace
+        - action: replace
+          source_labels:
+            - __meta_kubernetes_pod_name
+          target_label: pod
+        - action: replace
+          source_labels:
+            - __meta_kubernetes_pod_container_name
+          target_label: container
+        # Drop logs from promtail itself to avoid feedback loops.
+        - action: drop
+          source_labels: [job]
+          regex: ".*/promtail"
+
+# --- Common Helm Chart Settings ---
+
+# Create necessary ServiceAccounts and RBAC rules.
+serviceAccount:
+  create: true
+  name: "loki"
+  promtail:
+    create: true
+    name: "promtail"
+rbac:
+  create: true
+
+# Use modern Pod Security Admission standards.
+podSecurityContext:
+  enabled: true
+  fsGroup: 10001
+  runAsGroup: 10001
+  runAsUser: 10001
+
+# Promtail needs hostPath volumes to read container logs from the node.
+promtail:
+  extraVolumes:
+    - name: logs
+      hostPath:
+        path: /var/log/pods
+    - name: varlibdockercontainers
+      hostPath:
+        path: /var/lib/docker/containers
+  extraVolumeMounts:
+    - name: logs
+      mountPath: /var/log/pods
+      readOnly: true
+    - name: varlibdockercontainers
+      mountPath: /var/lib/docker/containers
+      readOnly: true
